@@ -47,8 +47,10 @@ const (
 //
 // A Reader automatically manages reconnections to a kafka server, and
 // blocking methods have context support for asynchronous cancellations.
+// reader 会自动管理到kafka服务器的重新连接
 //
 // Note that it is important to call `Close()` on a `Reader` when a process exits.
+// 退出要调用.Close方法
 // The kafka server needs a graceful disconnect to stop it from continuing to
 // attempt to send messages to the connected clients. The given example will not
 // call `Close()` if the process is terminated with SIGINT (ctrl-c at the shell) or
@@ -56,6 +58,8 @@ const (
 // delay when a new reader on the same topic connects (e.g. new process started
 // or new container running). Use a `signal.Notify` handler to close the reader on
 // process shutdown.
+// 如果没有及时关掉Close 可能会导致新的reader有延迟，理解下 leader觉得你还活着，
+// 新reader没有partition让你消费，当主动Close就会rebalance
 type Reader struct {
 	// immutable fields of the reader
 	config ReaderConfig
@@ -70,6 +74,7 @@ type Reader struct {
 	stop    context.CancelFunc
 	done    chan struct{}
 	commits chan commitRequest
+	// 每执行start就会++
 	version int64 // version holds the generation of the spawned readers
 	offset  int64
 	lag     int64
@@ -368,16 +373,19 @@ type ReaderConfig struct {
 	// The list of broker addresses used to connect to the kafka cluster.
 	Brokers []string
 
+	// GroupID 和 Partition只能指定一个。
 	// GroupID holds the optional consumer group id.  If GroupID is specified, then
 	// Partition should NOT be specified e.g. 0
 	GroupID string
 
+	// GroupTopics 只能和 GroupID(不为空)搭配使用
 	// GroupTopics allows specifying multiple topics, but can only be used in
 	// combination with GroupID, as it is a consumer-group feature. As such, if
 	// GroupID is set, then either Topic or GroupTopics must be defined.
 	GroupTopics []string
 
 	// The topic to read messages from.
+	// Topic必须指定
 	Topic string
 
 	// Partition to read messages from.  Either Partition or GroupID may
@@ -392,6 +400,7 @@ type ReaderConfig struct {
 	// set.
 	QueueCapacity int
 
+	// 设置太高可能会造成消费延迟，，，因为broker可能一直在凑数据
 	// MinBytes indicates to the broker the minimum batch size that the consumer
 	// will accept. Setting a high minimum when consuming from a low-volume topic
 	// may result in delayed delivery when the broker does not have enough data to
@@ -778,15 +787,19 @@ func (r *Reader) Close() error {
 // ReadMessage reads and return the next message from the r. The method call
 // blocks until a message becomes available, or an error occurs. The program
 // may also specify a context to asynchronously cancel the blocking operation.
+// 阻塞函数 可以通过ctx控制
 //
 // The method returns io.EOF to indicate that the reader has been closed.
+// io.EOF表示reader被closed
 //
 // If consumer groups are used, ReadMessage will automatically commit the
 // offset when called. Note that this could result in an offset being committed
 // before the message is fully processed.
+// 自动提交可能会导致offset在处理之前被提交
 //
 // If more fine grained control of when offsets are  committed is required, it
 // is recommended to use FetchMessage with CommitMessages instead.
+// FetchMessage 不会自动提交
 func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 	m, err := r.FetchMessage(ctx)
 	if err != nil {
@@ -810,13 +823,14 @@ func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 //
 // FetchMessage does not commit offsets automatically when using consumer groups.
 // Use CommitMessages to commit the offset.
+// 一次只能拉一条消息 有点蛋疼
 func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 	r.activateReadLag()
 
 	for {
 		r.mutex.Lock()
 
-		if !r.closed && r.version == 0 {
+		if !r.closed && r.version == 0 { // standalone consumer
 			r.start(r.getTopicPartitionOffset())
 		}
 
@@ -831,7 +845,7 @@ func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 			return Message{}, err
 
 		case m, ok := <-r.msgs:
-			if !ok {
+			if !ok { // 可以退出了
 				return Message{}, io.EOF
 			}
 
@@ -967,6 +981,8 @@ func (r *Reader) ReadLag(ctx context.Context) (lag int64, err error) {
 
 	select {
 	case off := <-offch:
+		// offset的值有点意思
+		// reader自己维护的offset
 		switch cur := r.Offset(); {
 		case cur == FirstOffset:
 			lag = off.last - off.first
@@ -1148,6 +1164,7 @@ func (r *Reader) activateReadLag() {
 	}
 }
 
+// 通过ctx控制 回收goroutine
 func (r *Reader) readLag(ctx context.Context) {
 	ticker := time.NewTicker(r.config.ReadLagInterval)
 	defer ticker.Stop()
@@ -1174,6 +1191,7 @@ func (r *Reader) readLag(ctx context.Context) {
 	}
 }
 
+// 起个协程 创建个reader 不停的读数据
 func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 	if r.closed {
 		// don't start child reader if parent Reader is closed
@@ -1184,7 +1202,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 
 	r.cancel() // always cancel the previous reader
 	r.cancel = cancel
-	r.version++
+	r.version++ // 复用
 
 	r.join.Add(len(offsetsByPartition))
 	for key, offset := range offsetsByPartition {
@@ -1216,6 +1234,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 // A reader reads messages from kafka and produces them on its channels, it's
 // used as an way to asynchronously fetch messages while the main program reads
 // them using the high level reader API.
+// 针对某个topic-partition的reader
 type reader struct {
 	dialer          *Dialer
 	logger          Logger
@@ -1242,6 +1261,7 @@ type readerMessage struct {
 	error     error
 }
 
+// loop 不停的从partition读数据，然后发送到r.msgs通道上
 func (r *reader) run(ctx context.Context, offset int64) {
 	// This is the reader's main loop, it only ends if the context is canceled
 	// and will keep attempting to reader messages otherwise.
@@ -1263,6 +1283,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 			log.Printf("initializing kafka reader for partition %d of %s starting at offset %d", r.partition, r.topic, offset)
 		})
 
+		// conn partition leader
 		conn, start, err := r.initialize(ctx, offset)
 		switch err {
 		case nil:
@@ -1307,6 +1328,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 				return
 			}
 
+			// batch read 返回最后的offset+1
 			switch offset, err = r.read(ctx, offset, conn); err {
 			case nil:
 				errcount = 0
@@ -1409,12 +1431,14 @@ func (r *reader) run(ctx context.Context, offset int64) {
 	}
 }
 
+// try 获取offset，然后seek到当前offset位置开始消费
 func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, start int64, err error) {
 	for i := 0; i != len(r.brokers) && conn == nil; i++ {
 		broker := r.brokers[i]
 		var first, last int64
 
 		t0 := time.Now()
+		// TODO：看下怎么找到leader的
 		conn, err = r.dialer.DialLeader(ctx, "tcp", broker, r.topic, r.partition)
 		t1 := time.Now()
 		r.stats.dials.observe(1)
@@ -1424,6 +1448,7 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 			continue
 		}
 
+		// 理解 first应该就是当前topic-partition记录的offset唯一
 		if first, last, err = r.readOffsets(conn); err != nil {
 			conn.Close()
 			conn = nil

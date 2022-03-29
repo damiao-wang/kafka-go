@@ -81,6 +81,7 @@ type Writer struct {
 	//
 	// This field is required, attempting to write messages to a writer with a
 	// nil address will error.
+	// brokers 默认
 	Addr net.Addr
 
 	// Topic is the name of the topic that the writer will produce messages to.
@@ -88,39 +89,47 @@ type Writer struct {
 	// Setting this field or not is a mutually exclusive option. If you set Topic
 	// here, you must not set Topic for any produced Message. Otherwise, if you	do
 	// not set Topic, every Message must have Topic specified.
+	// 创建Writer时设置Topic，那么在发送任何消息时不允许设置Topic，反之亦然。
 	Topic string
 
 	// The balancer used to distribute messages across partitions.
 	//
 	// The default is to use a round-robin distribution.
+	// 默认是rr
 	Balancer Balancer
 
 	// Limit on how many attempts will be made to deliver a message.
 	//
 	// The default is to try at most 10 times.
+	// 失败重试次数 默认10次
 	MaxAttempts int
 
 	// Limit on how many messages will be buffered before being sent to a
 	// partition.
 	//
 	// The default is to use a target batch size of 100 messages.
+	// 一次发送多少条消息到partition，默认100条
+	// TODO：batch 会立马返回resp吗？还是阻塞等待？
 	BatchSize int
 
 	// Limit the maximum size of a request in bytes before being sent to
 	// a partition.
 	//
 	// The default is to use a kafka default value of 1048576.
+	// 一次发送最大bytes到一个partition，默认1M
 	BatchBytes int64
 
 	// Time limit on how often incomplete message batches will be flushed to
 	// kafka.
 	//
 	// The default is to flush at least every second.
+	// 默认1s 刷下batch 缓存，如果没有batch成功的话
 	BatchTimeout time.Duration
 
 	// Timeout for read operations performed by the Writer.
 	//
 	// Defaults to 10 seconds.
+	// TODO: read what？
 	ReadTimeout time.Duration
 
 	// Timeout for write operation performed by the Writer.
@@ -136,6 +145,7 @@ type Writer struct {
 	//  RequireAll  (-1) wait for the full ISR to acknowledge the writes
 	//
 	// Defaults to RequireNone.
+	// 默认RequireNone，，，速度快 不过容易丢
 	RequiredAcks RequiredAcks
 
 	// Setting this flag to true causes the WriteMessages method to never block.
@@ -144,23 +154,30 @@ type Writer struct {
 	// whether the messages were written to kafka.
 	//
 	// Defaults to false.
+	// 异步写，默认关闭，只有当你不关心消息是否被写入kafka时才使用这个。
 	Async bool
 
 	// An optional function called when the writer succeeds or fails the
-	// delivery of messages to a kafka partition. When writing the messages
-	// fails, the `err` parameter will be non-nil.
+	// delivery of messages to a kafka partition.
+	// When writing the messages fails, the `err` parameter will be non-nil.
+	// 成功或失败的回调，当失败时，err入参为非空
 	//
 	// The messages that the Completion function is called with have their
 	// topic, partition, offset, and time set based on the Produce responses
 	// received from kafka. All messages passed to a call to the function have
-	// been written to the same partition. The keys and values of messages are
+	// been written to the same partition.
+	// 所有消息都是发送相同partition的
+	// The keys and values of messages are
 	// referencing the original byte slices carried by messages in the calls to
 	// WriteMessages.
 	//
 	// The function is called from goroutines started by the writer. Calls to
 	// Close will block on the Completion function calls. When the Writer is
 	// not writing asynchronously, the WriteMessages call will also block on
-	// Completion function, which is a useful guarantee if the byte slices
+	// Completion function,
+	// 如果没有打开异步写，那么WriteMessages会阻塞等待Completion func调用
+	//
+	// which is a useful guarantee if the byte slices
 	// for the message keys and values are intended to be reused after the
 	// WriteMessages call returned.
 	//
@@ -170,6 +187,7 @@ type Writer struct {
 	Completion func(messages []Message, err error)
 
 	// Compression set the compression codec to be used to compress messages.
+	// 压缩
 	Compression Compression
 
 	// If not nil, specifies a logger used to report internal changes within the
@@ -189,14 +207,14 @@ type Writer struct {
 	group   sync.WaitGroup
 	mutex   sync.Mutex
 	closed  bool
-	writers map[topicPartition]*partitionWriter
+	writers map[topicPartition]*partitionWriter // 按照topic-partition维度聚合数据
 
 	// writer stats are all made of atomic values, no need for synchronization.
 	// Use a pointer to ensure 64-bit alignment of the values. The once value is
 	// used to lazily create the value when first used, allowing programs to use
 	// the zero-value value of Writer.
-	once sync.Once
-	*writerStats
+	once         sync.Once
+	*writerStats // metrics
 
 	// If no balancer is configured, the writer uses this one. RoundRobin values
 	// are safe to use concurrently from multiple goroutines, there is no need
@@ -534,7 +552,8 @@ func (w *Writer) spawn(f func()) {
 }
 
 // Close flushes pending writes, and waits for all writes to complete before
-// returning. Calling Close also prevents new writes from being submitted to
+// returning.
+// Calling Close also prevents new writes from being submitted to
 // the writer, further calls to WriteMessages and the like will fail with
 // io.ErrClosedPipe.
 func (w *Writer) Close() error {
@@ -570,29 +589,39 @@ func (w *Writer) Close() error {
 // Unless the writer was configured to write messages asynchronously, the method
 // blocks until all messages have been written, or until the maximum number of
 // attempts was reached.
+// 阻塞调用，失败尝试调用attempts 次
 //
 // When sending synchronously and the writer's batch size is configured to be
 // greater than 1, this method blocks until either a full batch can be assembled
-// or the batch timeout is reached.  The batch size and timeouts are evaluated
+// or the batch timeout is reached.
+// 会阻塞等待batch，或batch timeout 返回
+//
+// The batch size and timeouts are evaluated // batch size 和 timeout 都是针对单个分区的
 // per partition, so the choice of Balancer can also influence the flushing
 // behavior.  For example, the Hash balancer will require on average N * batch
 // size messages to trigger a flush where N is the number of partitions.  The
+// hash策略下 需要N * batch size，才会flush
+// TODO: 我记得好像有策略可以 将发送的message 尽量往一个partition发送(组装batch)，
+// TODO：等一个partition batch满足条件了，就随机找下一个partition，全局看 message是分布均匀的。
+//
 // best way to achieve good batching behavior is to share one Writer amongst
 // multiple go routines.
+// 多goroutine共享一个writer
 //
 // When the method returns an error, it may be of type kafka.WriteError to allow
 // the caller to determine the status of each message.
+// 当返回error时，如果类型为WriteErrors时，WriteErrors为数组下标和msgs一一对应，所以可以知道每条msg的状态。
 //
 // The context passed as first argument may also be used to asynchronously
 // cancel the operation. Note that in this case there are no guarantees made on
 // whether messages were written to kafka. The program should assume that the
 // whole batch failed and re-write the messages later (which could then cause
 // duplicates).
+// 当被cancel掉的话，不能保证消息被写入kafka，并假设batch failed，需要caller re-write。
 func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 	if w.Addr == nil {
 		return errors.New("kafka.(*Writer).WriteMessages: cannot create a kafka writer with a nil address")
 	}
-
 	if !w.enter() {
 		return io.ErrClosedPipe
 	}
@@ -622,7 +651,8 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 	// of the message values for the same reason, int32 is 4 bytes, vs a full
 	// Message value which is 100+ bytes and contains pointers and contributes
 	// to increasing GC work.
-	assignments := make(map[topicPartition][]int32)
+	// -- save memory
+	assignments := make(map[topicPartition][]int32) // []int32 表示 msgs的下标
 
 	for i, msg := range msgs {
 		topic, err := w.chooseTopic(msg)
@@ -630,6 +660,7 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 			return err
 		}
 
+		// 获取partition数量
 		numPartitions, err := w.partitions(ctx, topic)
 		if err != nil {
 			return err
@@ -645,14 +676,17 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 		assignments[key] = append(assignments[key], int32(i))
 	}
 
+	// 这个就是异步写消息
 	batches := w.batchMessages(msgs, assignments)
 	if w.Async {
 		return nil
 	}
 
+	// 等待所有消息发送完成
+	// ctx的超时时间不能太小，因为batch没有full的话，只能等待 batchTime来flush
 	done := ctx.Done()
 	hasErrors := false
-	for batch := range batches {
+	for batch := range batches { // batch = *writeBatch(满了 或 超时会produce掉，填充error，且close(done))
 		select {
 		case <-done:
 			return ctx.Err()
@@ -678,8 +712,8 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 }
 
 func (w *Writer) batchMessages(messages []Message, assignments map[topicPartition][]int32) map[*writeBatch][]int32 {
-	var batches map[*writeBatch][]int32
-	if !w.Async {
+	var batches map[*writeBatch][]int32 // 只是用来返回数据的
+	if !w.Async {                       // 同步
 		batches = make(map[*writeBatch][]int32, len(assignments))
 	}
 
@@ -698,7 +732,7 @@ func (w *Writer) batchMessages(messages []Message, assignments map[topicPartitio
 		}
 		wbatches := writer.writeMessages(messages, indexes)
 
-		for batch, idxs := range wbatches {
+		for batch, idxs := range wbatches { // 异步的话 wbatches 为nil
 			batches[batch] = idxs
 		}
 	}
@@ -723,6 +757,7 @@ func (w *Writer) produce(key topicPartition, batch *writeBatch) (*ProduceRespons
 	})
 }
 
+// partitions 指定topic有多少个partition
 func (w *Writer) partitions(ctx context.Context, topic string) (int, error) {
 	client := w.client(w.readTimeout())
 	// Here we use the transport directly as an optimization to avoid the
@@ -869,6 +904,7 @@ func (w *Writer) Stats() WriterStats {
 	}
 }
 
+// 从msg 或 Writer 获取topic，不能同时都设置
 func (w *Writer) chooseTopic(msg Message) (string, error) {
 	// w.Topic and msg.Topic are mutually exclusive, meaning only 1 must be set
 	// otherwise we will return an error.
@@ -901,7 +937,7 @@ type batchQueue struct {
 func (b *batchQueue) Put(batch *writeBatch) bool {
 	b.cond.L.Lock()
 	defer b.cond.L.Unlock()
-	defer b.cond.Broadcast()
+	defer b.cond.Broadcast() // 广播
 
 	if b.closed {
 		return false
@@ -941,7 +977,7 @@ func newBatchQueue(initialSize int) batchQueue {
 	bq := batchQueue{
 		queue: make([]*writeBatch, 0, initialSize),
 		mutex: &sync.Mutex{},
-		cond: &sync.Cond{},
+		cond:  &sync.Cond{},
 	}
 
 	bq.cond.L = bq.mutex
@@ -963,16 +999,19 @@ type partitionWriter struct {
 	w *Writer
 }
 
+// 一个partition 对应一个异步writer
 func newPartitionWriter(w *Writer, key topicPartition) *partitionWriter {
 	writer := &partitionWriter{
 		meta:  key,
 		queue: newBatchQueue(10),
 		w:     w,
 	}
+	// 异步执行 w.group.Add(1)
 	w.spawn(writer.writeBatches)
 	return writer
 }
 
+// 批量写
 func (ptw *partitionWriter) writeBatches() {
 	for {
 		batch := ptw.queue.Get()
@@ -988,13 +1027,17 @@ func (ptw *partitionWriter) writeBatches() {
 	}
 }
 
+// 发往同一个partition的数据
+// writeBatch 会超时发送数据 或 batch is full的时候发送数据 到partitionWriter的queue里
+// 在partitionWriter创建时，会有一个不停从queue读取数据并发送到leader partition的协程
 func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*writeBatch][]int32 {
 	ptw.mutex.Lock()
 	defer ptw.mutex.Unlock()
 
-	batchSize := ptw.w.batchSize()
-	batchBytes := ptw.w.batchBytes()
+	batchSize := ptw.w.batchSize()   // 一批最大多少条消息 100
+	batchBytes := ptw.w.batchBytes() // 一次最多发多少字节消息 1M
 
+	// writeBatch 是不区分topic和partition
 	var batches map[*writeBatch][]int32
 	if !ptw.w.Async {
 		batches = make(map[*writeBatch][]int32, 1)
@@ -1002,25 +1045,28 @@ func (ptw *partitionWriter) writeMessages(msgs []Message, indexes []int32) map[*
 
 	for _, i := range indexes {
 	assignMessage:
-		batch := ptw.currBatch
+		batch := ptw.currBatch // *writeBatch
 		if batch == nil {
 			batch = ptw.newWriteBatch()
 			ptw.currBatch = batch
 		}
+		// add失败：batch字节>max bytes
+		// add 把msg 加到batch.msgs 队列
 		if !batch.add(msgs[i], batchSize, batchBytes) {
 			batch.trigger()
 			ptw.queue.Put(batch)
 			ptw.currBatch = nil
-			goto assignMessage
+			goto assignMessage // trigger是上一批的 所以goto回去
 		}
 
+		// size == max || bytes == max
 		if batch.full(batchSize, batchBytes) {
 			batch.trigger()
 			ptw.queue.Put(batch)
 			ptw.currBatch = nil
 		}
 
-		if !ptw.w.Async {
+		if !ptw.w.Async { // 同步
 			batches[batch] = append(batches[batch], i)
 		}
 	}
@@ -1039,7 +1085,7 @@ func (ptw *partitionWriter) newWriteBatch() *writeBatch {
 // expires it will queue the batch for writing if needed.
 func (ptw *partitionWriter) awaitBatch(batch *writeBatch) {
 	select {
-	case <-batch.timer.C:
+	case <-batch.timer.C: // 超时发送batch
 		ptw.mutex.Lock()
 		// detach the batch from the writer if we're still attached
 		// and queue for writing.
@@ -1054,6 +1100,7 @@ func (ptw *partitionWriter) awaitBatch(batch *writeBatch) {
 		}
 		ptw.mutex.Unlock()
 	case <-batch.ready:
+		// 说明batch 已经满了，不用等待超时发送了
 		// The batch became full, it was removed from the ptwriter and its
 		// ready channel was closed. We need to close the timer to avoid
 		// having it leak until it expires.
@@ -1061,7 +1108,9 @@ func (ptw *partitionWriter) awaitBatch(batch *writeBatch) {
 	}
 }
 
+// 发送数据到leader partition
 func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
+	// stats 统计
 	stats := ptw.w.stats()
 	stats.batchTime.observe(int64(time.Since(batch.time)))
 	stats.batchSize.observe(int64(len(batch.msgs)))
@@ -1070,8 +1119,9 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 	var res *ProduceResponse
 	var err error
 	key := ptw.meta
+	// 尝试MaxAttempts 次
 	for attempt, maxAttempts := 0, ptw.w.maxAttempts(); attempt < maxAttempts; attempt++ {
-		if attempt != 0 {
+		if attempt != 0 { // 说明不是第一次，就backoff
 			stats.retries.observe(1)
 			// TODO: should there be a way to asynchronously cancel this
 			// operation?
@@ -1095,6 +1145,7 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 		})
 
 		start := time.Now()
+		// 发送消息 topic，partition，ack，compression，message_record
 		res, err = ptw.w.produce(key, batch)
 
 		stats.writes.observe(1)
@@ -1122,6 +1173,7 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 			log.Printf("error writing messages to %s (partition %d): %s", key.topic, key.partition, err)
 		})
 
+		// 不太懂
 		if !isTemporary(err) && !isTransientNetworkError(err) {
 			break
 		}
@@ -1140,6 +1192,7 @@ func (ptw *partitionWriter) writeBatch(batch *writeBatch) {
 		}
 	}
 
+	// 异步更加需要 回调函数，需要业务判断如何处理这一批次错误的msgs
 	if ptw.w.Completion != nil {
 		ptw.w.Completion(batch.msgs, err)
 	}

@@ -126,6 +126,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, address string
 // The address given to the DialContext method may not be the one that the
 // connection will end up being established to, because the dialer will lookup
 // the partition leader for the topic and return a connection to that server.
+// addr不一定就是最终建连的地址，分成两步：1.连接获取brokers的metadata；2.根据元信息找到topic-partition的leader 然后建连。
 // The original address is only used as a mechanism to discover the
 // configuration of the kafka cluster that we're connecting to.
 func (d *Dialer) DialLeader(ctx context.Context, network string, address string, topic string, partition int) (*Conn, error) {
