@@ -613,6 +613,7 @@ const (
 	// constants to skip the bound check that the connection would do otherwise.
 	// Programs can use this flag to avoid making a metadata request to the kafka
 	// broker to read the current first and last offsets of the partition.
+	// SeekAbsolute SeekCurrent 会跳过check。避免向broker请求当前分区的first和last偏移量。
 	SeekDontCheck = 1 << 30
 )
 

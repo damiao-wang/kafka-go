@@ -23,6 +23,9 @@ type Balancer interface {
 	// sets of partitions (from different topics for examples), use one balancer
 	// instance for each partition set, so the balancer can detect when the
 	// partitions change and assume that the kafka topic has been rebalanced.
+	// TODO: 不太理解？
+	// 一个应用程序应该避免使用一个balancer来管理多个分区集(例如从多个topic的)
+	// 一个分区集使用一个balancer，当分区改变时，balancer可以检测到并假设topic已经被Rebalanced
 	Balance(msg Message, partitions ...int) (partition int)
 }
 
@@ -60,6 +63,8 @@ func (rr *RoundRobin) balance(partitions []int) int {
 // Note that no coordination is done between multiple producers, having good
 // balancing relies on the fact that each producer using a LeastBytes balancer
 // should produce well balanced messages.
+// LeastBytes 是保存在writer client端的自己的发送统计。
+// 如果每个producer生产的数据量都差不多，而且都采用LeastBytes策略，那么长远的相对来看是比较平均的。
 type LeastBytes struct {
 	mutex    sync.Mutex
 	counters []leastBytesCounter

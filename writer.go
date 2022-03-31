@@ -184,6 +184,7 @@ type Writer struct {
 	// If a completion function panics, the program terminates because the
 	// panic is not recovered by the writer and bubbles up to the top of the
 	// goroutine's call stack.
+	// 异步写时 比较有用
 	Completion func(messages []Message, err error)
 
 	// Compression set the compression codec to be used to compress messages.
@@ -766,6 +767,7 @@ func (w *Writer) partitions(ctx context.Context, topic string) (int, error) {
 	//
 	// It is expected that the transport will optimize this request by
 	// caching recent results (the kafka.Transport types does).
+	// (*Client)做了优化，会缓存返回的Metadata信息
 	r, err := client.transport().RoundTrip(ctx, client.Addr, &metadataAPI.Request{
 		TopicNames:             []string{topic},
 		AllowAutoTopicCreation: true,

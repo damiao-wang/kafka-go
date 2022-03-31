@@ -74,7 +74,7 @@ type Reader struct {
 	stop    context.CancelFunc
 	done    chan struct{}
 	commits chan commitRequest
-	// 每执行start就会++
+	// 每执行Reader.start就会++
 	version int64 // version holds the generation of the spawned readers
 	offset  int64
 	lag     int64
@@ -88,7 +88,7 @@ type Reader struct {
 	// FetchMessage know that an error indeed occurred. If an error in run
 	// occurs, it will be non-block-sent to this unbuffered channel, where
 	// the high-level methods can select{} on it and notify the caller.
-	runError chan error
+	runError chan error // TODO: 确定下
 
 	// reader stats are all made of atomic values, no need for synchronization.
 	once  uint32
@@ -225,7 +225,7 @@ func (r *Reader) commitLoopImmediate(ctx context.Context, gen *Generation) {
 			for hasCommits := true; hasCommits; {
 				select {
 				case req := <-r.commits:
-					offsets.merge(req.commits)
+					offsets.merge(req.commits) // 找partition提交的最大的offset
 					errchs = append(errchs, req.errch)
 				default:
 					hasCommits = false
@@ -257,6 +257,7 @@ func (r *Reader) commitLoopInterval(ctx context.Context, gen *Generation) {
 	offsets := offsetStash{}
 
 	commit := func() {
+		// len(offsets) == 0 时，不会进行真正的提交
 		if err := r.commitOffsetsWithRetry(gen, offsets, defaultCommitRetries); err != nil {
 			r.withErrorLogger(func(l Logger) { l.Printf(err.Error()) })
 		} else {
@@ -289,6 +290,7 @@ func (r *Reader) commitLoopInterval(ctx context.Context, gen *Generation) {
 }
 
 // commitLoop processes commits off the commit chan
+// 从r.commits获取要提交的offsets，进行merge，然后通过gen的连接，提交offset
 func (r *Reader) commitLoop(ctx context.Context, gen *Generation) {
 	r.withLogger(func(l Logger) {
 		l.Printf("started commit for group %s\n", r.config.GroupID)
@@ -322,7 +324,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 		var err error
 		var gen *Generation
 		for attempt := 1; attempt <= r.config.MaxAttempts; attempt++ {
-			gen, err = cg.Next(r.stctx)
+			gen, err = cg.Next(r.stctx) // 获取Generation，正常情况应该会阻塞
 			if err == nil {
 				break
 			}
@@ -349,6 +351,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 
 		r.stats.rebalances.observe(1)
 
+		// 订阅分配的partition，开始读数据(异步)
 		r.subscribe(gen.Assignments)
 
 		gen.Start(func(ctx context.Context) {
@@ -362,6 +365,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 			case <-r.stctx.Done():
 				// this will be the last loop because the reader is closed.
 			}
+			// 关闭的话，取消订阅
 			r.unsubscribe()
 		})
 	}
@@ -374,6 +378,7 @@ type ReaderConfig struct {
 	Brokers []string
 
 	// GroupID 和 Partition只能指定一个。
+	// 当设置了GroupID时，Topic或GroupTopics必须被set
 	// GroupID holds the optional consumer group id.  If GroupID is specified, then
 	// Partition should NOT be specified e.g. 0
 	GroupID string
@@ -385,7 +390,6 @@ type ReaderConfig struct {
 	GroupTopics []string
 
 	// The topic to read messages from.
-	// Topic必须指定
 	Topic string
 
 	// Partition to read messages from.  Either Partition or GroupID may
@@ -398,6 +402,7 @@ type ReaderConfig struct {
 
 	// The capacity of the internal message queue, defaults to 100 if none is
 	// set.
+	// TODO：内部消息队列？
 	QueueCapacity int
 
 	// 设置太高可能会造成消费延迟，，，因为broker可能一直在凑数据
@@ -407,6 +412,8 @@ type ReaderConfig struct {
 	// satisfy the defined minimum.
 	//
 	// Default: 1
+	// 设置比较小的话 响应比较及时
+	// TODO: consumer 怎么知道broker堆积了多少数据呢？
 	MinBytes int
 
 	// MaxBytes indicates to the broker the maximum batch size that the consumer
@@ -414,16 +421,19 @@ type ReaderConfig struct {
 	// choose a value that is high enough for your largest message size.
 	//
 	// Default: 1MB
+	// 每次fetch最大字节数据
 	MaxBytes int
 
 	// Maximum amount of time to wait for new data to come when fetching batches
 	// of messages from kafka.
 	//
 	// Default: 10s
+	// 如果不满足MinBytes时，多久fetch一次
 	MaxWait time.Duration
 
 	// ReadLagInterval sets the frequency at which the reader lag is updated.
 	// Setting this field to a negative value disables lag reporting.
+	// TODO: 关注下用法
 	ReadLagInterval time.Duration
 
 	// GroupBalancers is the priority-ordered list of client-side consumer group
@@ -458,6 +468,7 @@ type ReaderConfig struct {
 	// Default: 5s
 	//
 	// Only used when GroupID is set and WatchPartitionChanges is set.
+	// TODO: rebalance
 	PartitionWatchInterval time.Duration
 
 	// WatchForPartitionChanges is used to inform kafka-go that a consumer group should be
@@ -475,6 +486,7 @@ type ReaderConfig struct {
 	// RebalanceTimeout optionally sets the length of time the coordinator will wait
 	// for members to join as part of a rebalance.  For kafka servers under higher
 	// load, it may be useful to set this value higher.
+	// kafka server 负载比较高时，最好设置的大一点。
 	//
 	// Default: 30s
 	//
@@ -493,6 +505,7 @@ type ReaderConfig struct {
 	// Default: 24h
 	//
 	// Only used when GroupID is set
+	// TODO：消费者组被broker保存多久？
 	RetentionTime time.Duration
 
 	// StartOffset determines from whence the consumer group should begin
@@ -502,18 +515,21 @@ type ReaderConfig struct {
 	// Default: FirstOffset
 	//
 	// Only used when GroupID is set
+	// 没有committed offset时，应该怎么取offset
 	StartOffset int64
 
 	// BackoffDelayMin optionally sets the smallest amount of time the reader will wait before
 	// polling for new messages
 	//
 	// Default: 100ms
+	// poll 新消息前，最少要等待的时间(和MaxWait的区别？)
 	ReadBackoffMin time.Duration
 
 	// BackoffDelayMax optionally sets the maximum amount of time the reader will wait before
 	// polling for new messages
 	//
 	// Default: 1s
+	// 读取 新消息前，最大等待时间
 	ReadBackoffMax time.Duration
 
 	// If not nil, specifies a logger used to report internal changes within the
@@ -527,11 +543,13 @@ type ReaderConfig struct {
 	// IsolationLevel controls the visibility of transactional records.
 	// ReadUncommitted makes all records visible. With ReadCommitted only
 	// non-transactional and committed records are visible.
+	// 事务相关的隔离级别
 	IsolationLevel IsolationLevel
 
 	// Limit of how many attempts will be made before delivering the error.
 	//
 	// The default is to try 3 times.
+	// 最大重试次数
 	MaxAttempts int
 }
 
@@ -725,7 +743,7 @@ func NewReader(config ReaderConfig) *Reader {
 		},
 		version: version,
 	}
-	if r.useConsumerGroup() {
+	if r.useConsumerGroup() { // 使用消费者组
 		r.done = make(chan struct{})
 		r.runError = make(chan error)
 		cg, err := NewConsumerGroup(ConsumerGroupConfig{
@@ -795,11 +813,13 @@ func (r *Reader) Close() error {
 // If consumer groups are used, ReadMessage will automatically commit the
 // offset when called. Note that this could result in an offset being committed
 // before the message is fully processed.
-// 自动提交可能会导致offset在处理之前被提交
+//
 //
 // If more fine grained control of when offsets are  committed is required, it
 // is recommended to use FetchMessage with CommitMessages instead.
 // FetchMessage 不会自动提交
+//
+// 自动提交可能会导致offset在处理之前被提交(可能造成丢数据)
 func (r *Reader) ReadMessage(ctx context.Context) (Message, error) {
 	m, err := r.FetchMessage(ctx)
 	if err != nil {
@@ -854,7 +874,7 @@ func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 
 				switch {
 				case m.error != nil:
-				case version == r.version:
+				case version == r.version: // 更新offset 和 lag
 					r.offset = m.message.Offset + 1
 					r.lag = m.watermark - r.offset
 				}
@@ -1191,7 +1211,7 @@ func (r *Reader) readLag(ctx context.Context) {
 	}
 }
 
-// 起个协程 创建个reader 不停的读数据
+// 起topic-partition个协程 创建个reader 不停的读数据
 func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 	if r.closed {
 		// don't start child reader if parent Reader is closed
@@ -1284,6 +1304,7 @@ func (r *reader) run(ctx context.Context, offset int64) {
 		})
 
 		// conn partition leader
+		// conn 已经seek到offset位置
 		conn, start, err := r.initialize(ctx, offset)
 		switch err {
 		case nil:
@@ -1323,17 +1344,19 @@ func (r *reader) run(ctx context.Context, offset int64) {
 		errcount := 0
 	readLoop:
 		for {
+			// 每次batch读取完后，都backoff下，再进行读取
 			if !sleep(ctx, backoff(errcount, r.backoffDelayMin, r.backoffDelayMax)) {
 				conn.Close()
 				return
 			}
 
 			// batch read 返回最后的offset+1
+			// 理解：r.read不会返回err==nil，因为err==nil的话 不能退出死循环，一定是读到io.EOF
 			switch offset, err = r.read(ctx, offset, conn); err {
 			case nil:
 				errcount = 0
 				continue
-			case io.EOF:
+			case io.EOF: // 完成本次batch的读取
 				// done with this batch of messages...carry on.  note that this
 				// block relies on the batch repackaging real io.EOF errors as
 				// io.UnexpectedEOF.  otherwise, we would end up swallowing real
@@ -1462,7 +1485,7 @@ func (r *reader) initialize(ctx context.Context, offset int64) (conn *Conn, star
 		case offset == LastOffset:
 			offset = last
 
-		case offset < first:
+		case offset < first: // 说明太久没消费了，部分数据丢失了(归档)
 			offset = first
 		}
 
@@ -1489,6 +1512,7 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 	t0 := time.Now()
 	conn.SetReadDeadline(t0.Add(r.maxWait))
 
+	// maxWait 或 满足minBytes时，batch就会返回，并携带rbuf
 	batch := conn.ReadBatchWith(ReadBatchConfig{
 		MinBytes:       r.minBytes,
 		MaxBytes:       r.maxBytes,
@@ -1514,8 +1538,8 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 			conn.SetReadDeadline(deadline)
 		}
 
-		if msg, err = batch.ReadMessage(); err != nil {
-			batch.Close()
+		if msg, err = batch.ReadMessage(); err != nil { // EOF 就退出本次读取
+			batch.Close() // 这里会设置conn.offset = batch.offset 那么下次read时，就会从最新的offset处读取了；
 			break
 		}
 
@@ -1523,6 +1547,7 @@ func (r *reader) read(ctx context.Context, offset int64, conn *Conn) (int64, err
 		r.stats.messages.observe(1)
 		r.stats.bytes.observe(n)
 
+		// 发送message 到r.msgs chain中
 		if err = r.sendMessage(ctx, msg, highWaterMark); err != nil {
 			batch.Close()
 			break

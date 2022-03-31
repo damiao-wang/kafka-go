@@ -142,6 +142,7 @@ type ProduceResponse struct {
 //
 // When the request is configured with RequiredAcks=none, both the response and
 // the error will be nil on success.
+// 个人理解，Client应该做了优化，保存有Broker的Metadata信息，所以Produce时，应该直接发送给leader partition所在的Broker。
 func (c *Client) Produce(ctx context.Context, req *ProduceRequest) (*ProduceResponse, error) {
 	attributes := protocol.Attributes(req.Compression) & 0x7
 

@@ -111,8 +111,8 @@ func (r RoundRobinGroupBalancer) UserData() ([]byte, error) {
 }
 
 func (r RoundRobinGroupBalancer) AssignGroups(members []GroupMember, topicPartitions []Partition) GroupMemberAssignments {
-	groupAssignments := GroupMemberAssignments{}
-	membersByTopic := findMembersByTopic(members)
+	groupAssignments := GroupMemberAssignments{}  // map[memberID]map[topic][]partition
+	membersByTopic := findMembersByTopic(members) // map[memberID][]partition
 	for topic, members := range membersByTopic {
 		partitionIDs := findPartitions(topic, topicPartitions)
 		memberCount := len(members)

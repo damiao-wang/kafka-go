@@ -497,6 +497,7 @@ func (g *Generation) heartbeatLoop(interval time.Duration) {
 // a bad spot and should rebalance. Commonly you will see an error here if there
 // is a problem with the connection to the coordinator and a rebalance will
 // establish a new connection to the coordinator.
+// 通常，如果到coordinator的连接有问题，rebalance会建立到coordinator的新连接
 func (g *Generation) partitionWatcher(interval time.Duration, topic string) {
 	g.Start(func(ctx context.Context) {
 		g.log(func(l Logger) {
@@ -509,6 +510,7 @@ func (g *Generation) partitionWatcher(interval time.Duration, topic string) {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// 获取当前的partitions
 		ops, err := g.conn.readPartitions(topic)
 		if err != nil {
 			g.logError(func(l Logger) {
@@ -643,6 +645,7 @@ func (t *timeoutCoordinator) readPartitions(topics ...string) ([]Partition, erro
 // provided configuration is invalid.  It does not attempt to connect to the
 // Kafka cluster.  That happens asynchronously, and any errors will be reported
 // by Next.
+// TODO：有点好奇 怎样触发rebalance
 func NewConsumerGroup(config ConsumerGroupConfig) (*ConsumerGroup, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -718,6 +721,10 @@ func (cg *ConsumerGroup) run() {
 	var memberID string
 	var err error
 	for {
+		// join group
+		// if leader, assign partitions
+		// heartbeat、watch partition
+		// 正常情况下 会一直阻塞
 		memberID, err = cg.nextGeneration(memberID)
 
 		// backoff will be set if this go routine should sleep before continuing
@@ -774,6 +781,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 	// re-connect in certain cases, but that shouldn't be an issue given that
 	// rebalances are relatively infrequent under normal operating
 	// conditions.
+	// 获取coordinator最新的连接
 	conn, err := cg.coordinator()
 	if err != nil {
 		cg.withErrorLogger(func(log Logger) {
@@ -789,6 +797,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 
 	// join group.  this will join the group and prepare assignments if our
 	// consumer is elected leader.  it may also change or assign the member ID.
+	// 加入Group，如果被选为leader的话groupAssignments!=nil
 	memberID, generationID, groupAssignments, err = cg.joinGroup(conn, memberID)
 	if err != nil {
 		cg.withErrorLogger(func(log Logger) {
@@ -801,6 +810,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 	})
 
 	// sync group
+	// 将信息同步给coordinator，并获取该consumer应该消费的map[topic][]partition
 	assignments, err = cg.syncGroup(conn, memberID, generationID, groupAssignments)
 	if err != nil {
 		cg.withErrorLogger(func(log Logger) {
@@ -809,7 +819,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 		return memberID, err
 	}
 
-	// fetch initial offsets.
+	// fetch initial offsets. map[topic]map[partitionID]offset
 	var offsets map[string]map[int]int64
 	offsets, err = cg.fetchOffsets(conn, assignments)
 	if err != nil {
@@ -824,8 +834,8 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 		ID:              generationID,
 		GroupID:         cg.config.ID,
 		MemberID:        memberID,
-		Assignments:     cg.makeAssignments(assignments, offsets),
-		conn:            conn,
+		Assignments:     cg.makeAssignments(assignments, offsets), // map[topic][]partition_with_offset
+		conn:            conn,                                     //coordinator最新的连接
 		done:            make(chan struct{}),
 		joined:          make(chan struct{}),
 		retentionMillis: int64(cg.config.RetentionTime / time.Millisecond),
@@ -836,8 +846,10 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 	// spawn all of the go routines required to facilitate this generation.  if
 	// any of these functions exit, then the generation is determined to be
 	// complete.
+	// 发送心跳 Loop。。。
 	gen.heartbeatLoop(cg.config.HeartbeatInterval)
 	if cg.config.WatchPartitionChanges {
+		// 不断的watch topic的partitions
 		for _, topic := range cg.config.Topics {
 			gen.partitionWatcher(cg.config.PartitionWatchInterval, topic)
 		}
@@ -925,6 +937,7 @@ func (cg *ConsumerGroup) coordinator() (coordinator, error) {
 //  * InconsistentGroupProtocol:
 //  * InvalidSessionTimeout:
 //  * GroupAuthorizationFailed:
+// 加入Group，并返回memberID，generationID，如果是leader的话，返回分配任务(否则返回nil)
 func (cg *ConsumerGroup) joinGroup(conn coordinator, memberID string) (string, int32, GroupMemberAssignments, error) {
 	request, err := cg.makeJoinGroupRequestV1(memberID)
 	if err != nil {
@@ -947,6 +960,7 @@ func (cg *ConsumerGroup) joinGroup(conn coordinator, memberID string) (string, i
 	})
 
 	var assignments GroupMemberAssignments
+	// 如果我是leader的话，我就按照balancer策略对该GroupID下的每个consumer分配任务
 	if iAmLeader := response.MemberID == response.LeaderID; iAmLeader {
 		v, err := cg.assignTopicPartitions(conn, response)
 		if err != nil {
@@ -1001,6 +1015,7 @@ func (cg *ConsumerGroup) makeJoinGroupRequestV1(memberID string) (joinGroupReque
 
 // assignTopicPartitions uses the selected GroupBalancer to assign members to
 // their various partitions
+// 已balancer的方式 分配每个consumer的消费任务 map[memberID]map[topic][]partition
 func (cg *ConsumerGroup) assignTopicPartitions(conn coordinator, group joinGroupResponseV1) (GroupMemberAssignments, error) {
 	cg.withLogger(func(l Logger) {
 		l.Printf("selected as leader for group, %s\n", cg.config.ID)
@@ -1072,6 +1087,7 @@ func (cg *ConsumerGroup) makeMemberProtocolMetadata(in []joinGroupResponseMember
 //  * IllegalGeneration:
 //  * RebalanceInProgress:
 //  * GroupAuthorizationFailed:
+// 将信息同步给coordinator，并获取该consumer应该消费的map[topic][]partition
 func (cg *ConsumerGroup) syncGroup(conn coordinator, memberID string, generationID int32, memberAssignments GroupMemberAssignments) (map[string][]int32, error) {
 	request := cg.makeSyncGroupRequestV0(memberID, generationID, memberAssignments)
 	response, err := conn.syncGroup(request)
