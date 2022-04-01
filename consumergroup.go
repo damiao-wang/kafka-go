@@ -104,6 +104,7 @@ type ConsumerGroupConfig struct {
 
 	// WatchForPartitionChanges is used to inform kafka-go that a consumer group should be
 	// polling the brokers and rebalancing if any partition changes happen to the topic.
+	// 如果主题分区发生变化，Consumer Group应该轮训Broker并执行重平衡
 	WatchPartitionChanges bool
 
 	// SessionTimeout optionally sets the length of time that may pass without a heartbeat
@@ -372,6 +373,7 @@ func (g *Generation) close() {
 // generation.  If the function does not exit promptly, it will stop forward
 // progress for this consumer and potentially cause consumer group membership
 // churn.
+// 如果fn返回的话，g.closed = true了，也会关闭g.done，从而执行g.close()
 func (g *Generation) Start(fn func(ctx context.Context)) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
@@ -398,7 +400,7 @@ func (g *Generation) Start(fn func(ctx context.Context)) {
 		// shut down the generation as soon as one function exits.  this is
 		// different from close() in that it doesn't wait for all go routines in
 		// the generation to exit.
-		if !g.closed {
+		if !g.closed { // close false -> true
 			close(g.done)
 			g.closed = true
 		}
@@ -478,6 +480,9 @@ func (g *Generation) heartbeatLoop(interval time.Duration) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// TODO: 不应该从心跳获取Error Code吗？来进行重平衡
+				// RebalanceInProgress 错误已经实现error接口，所以应该是返回err
+				// 所以重平衡时，心跳就退出了
 				_, err := g.conn.heartbeat(heartbeatRequestV0{
 					GroupID:      g.GroupID,
 					GenerationID: g.ID,
@@ -527,7 +532,7 @@ func (g *Generation) partitionWatcher(interval time.Duration, topic string) {
 				ops, err := g.conn.readPartitions(topic)
 				switch err {
 				case nil, UnknownTopicOrPartition:
-					if len(ops) != oParts {
+					if len(ops) != oParts { // 重平衡
 						g.log(func(l Logger) {
 							l.Printf("Partition changes found, reblancing group: %v.", g.GroupID)
 						})
@@ -646,6 +651,7 @@ func (t *timeoutCoordinator) readPartitions(topics ...string) ([]Partition, erro
 // Kafka cluster.  That happens asynchronously, and any errors will be reported
 // by Next.
 // TODO：有点好奇 怎样触发rebalance
+// 通过心跳返回的错误 或者 WatchTopicPartitions的变动 来退出gen.Start导致执行gen.close
 func NewConsumerGroup(config ConsumerGroupConfig) (*ConsumerGroup, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
@@ -739,7 +745,7 @@ func (cg *ConsumerGroup) run() {
 			// the CG has been closed...leave the group and exit loop.
 			_ = cg.leaveGroup(memberID)
 			return
-		case RebalanceInProgress:
+		case RebalanceInProgress: // 表示要进行Rebalance了
 			// in case of a RebalanceInProgress, don't leave the group or
 			// change the member ID, but report the error.  the next attempt
 			// to join the group will then be subject to the rebalance
@@ -781,6 +787,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 	// re-connect in certain cases, but that shouldn't be an issue given that
 	// rebalances are relatively infrequent under normal operating
 	// conditions.
+	// 在正常情况下Rebalance比较少，所以每次获取新连接问题不大。
 	// 获取coordinator最新的连接
 	conn, err := cg.coordinator()
 	if err != nil {
@@ -820,6 +827,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 	}
 
 	// fetch initial offsets. map[topic]map[partitionID]offset
+	// 获取该Consumer需要消费的最新的offset
 	var offsets map[string]map[int]int64
 	offsets, err = cg.fetchOffsets(conn, assignments)
 	if err != nil {
@@ -868,6 +876,7 @@ func (cg *ConsumerGroup) nextGeneration(memberID string) (string, error) {
 
 	// wait for generation to complete.  if the CG is closed before the
 	// generation is finished, exit and leave the group.
+	// 阻塞到这
 	select {
 	case <-cg.done:
 		gen.close()

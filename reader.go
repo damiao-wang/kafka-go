@@ -70,7 +70,7 @@ type Reader struct {
 	// mutable fields of the reader (synchronized on the mutex)
 	mutex   sync.Mutex
 	join    sync.WaitGroup
-	cancel  context.CancelFunc
+	cancel  context.CancelFunc // 控制子reader(真正读数据)退出
 	stop    context.CancelFunc
 	done    chan struct{}
 	commits chan commitRequest
@@ -267,7 +267,7 @@ func (r *Reader) commitLoopInterval(ctx context.Context, gen *Generation) {
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-ctx.Done(): // gen退出，也会做一次commit，不错。
 			// drain the commit channel in order to prepare the final commit.
 			for hasCommits := true; hasCommits; {
 				select {
@@ -291,6 +291,9 @@ func (r *Reader) commitLoopInterval(ctx context.Context, gen *Generation) {
 
 // commitLoop processes commits off the commit chan
 // 从r.commits获取要提交的offsets，进行merge，然后通过gen的连接，提交offset
+// gen退出对commit影响：
+// 1. gen.conn 不受影响
+// 2. gen退出后，ctx.Done就退出了
 func (r *Reader) commitLoop(ctx context.Context, gen *Generation) {
 	r.withLogger(func(l Logger) {
 		l.Printf("started commit for group %s\n", r.config.GroupID)
@@ -324,6 +327,9 @@ func (r *Reader) run(cg *ConsumerGroup) {
 		var err error
 		var gen *Generation
 		for attempt := 1; attempt <= r.config.MaxAttempts; attempt++ {
+			// Rebalance 时，cg.Next会返回一个新的gen
+			// 注意当收到新的gen时，老gen的Start就已经全部退出了，所以不会又并发问题
+			// 由gen.close 来保证
 			gen, err = cg.Next(r.stctx) // 获取Generation，正常情况应该会阻塞
 			if err == nil {
 				break
@@ -354,6 +360,7 @@ func (r *Reader) run(cg *ConsumerGroup) {
 		// 订阅分配的partition，开始读数据(异步)
 		r.subscribe(gen.Assignments)
 
+		// gen 退出 ctx.Done就close了，然后就释放Start的goroutine了
 		gen.Start(func(ctx context.Context) {
 			r.commitLoop(ctx, gen)
 		})
@@ -366,6 +373,8 @@ func (r *Reader) run(cg *ConsumerGroup) {
 				// this will be the last loop because the reader is closed.
 			}
 			// 关闭的话，取消订阅
+			// 等待所有的topic-partition退出
+			// 意思是 关闭所有的读操作。。。 确实够狠啊
 			r.unsubscribe()
 		})
 	}
@@ -874,7 +883,7 @@ func (r *Reader) FetchMessage(ctx context.Context) (Message, error) {
 
 				switch {
 				case m.error != nil:
-				case version == r.version: // 更新offset 和 lag
+				case version == r.version: // 更新offset 和 lag 乐观锁
 					r.offset = m.message.Offset + 1
 					r.lag = m.watermark - r.offset
 				}
@@ -1023,6 +1032,7 @@ func (r *Reader) ReadLag(ctx context.Context) (lag int64, err error) {
 
 // Offset returns the current absolute offset of the reader, or -1
 // if r is backed by a consumer group.
+// 下一个该要读取的offset
 func (r *Reader) Offset() int64 {
 	if r.useConsumerGroup() {
 		return -1
@@ -1255,6 +1265,7 @@ func (r *Reader) start(offsetsByPartition map[topicPartition]int64) {
 // used as an way to asynchronously fetch messages while the main program reads
 // them using the high level reader API.
 // 针对某个topic-partition的reader
+// reader的作用就是不停的读数据
 type reader struct {
 	dialer          *Dialer
 	logger          Logger
